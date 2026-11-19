@@ -12,13 +12,18 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
+import webbrowser
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import marca_tk as MT
 from traduccions import IDIOMES, NOMS_IDIOMES, T
 
-VERSIO = "1.0"
+VERSIO = "1.1"
+URL_VERSIO = "https://xoriguer.dev/versions/cercador/versio.json"
+WEB = "https://xoriguer.dev/#p-cercador"
 
 # ── Paleta «Blau pissarra» ─────────────────────────────────────────────
 FONS = "#1E2A3B"
@@ -139,9 +144,16 @@ class App(tk.Tk):
         self.v_altres = tk.StringVar(value=self.ajustos.get("altres", ""))
         self.v_sistema = tk.BooleanVar(value=self.ajustos.get("sistema", True))
         self.v_petites = tk.BooleanVar(value=self.ajustos.get("petites", True))
+        self.v_mida_min = tk.IntVar(value=self.ajustos.get("mida_min", 30))
+        self.v_ometre = tk.StringVar(value=self.ajustos.get("ometre", ""))
+        self.v_so = tk.BooleanVar(value=self.ajustos.get("so", True))
+        self.v_auto = tk.BooleanVar(value=self.ajustos.get("auto_act", True))
+        self.v_any_des = tk.StringVar(value=self.ajustos.get("any_des", ""))
+        self.v_any_fins = tk.StringVar(value=self.ajustos.get("any_fins", ""))
         self.v_origen = tk.StringVar()
         self.v_desti = tk.StringVar(value=self.ajustos.get("desti", ""))
-        self.v_carpetes = tk.BooleanVar(value=self.ajustos.get("carpetes", True))
+        org = self.ajustos.get("org") or ("carpetes" if self.ajustos.get("carpetes", True) else "junt")
+        self.v_org = tk.StringVar(value=org)
         self.v_duplicats = tk.BooleanVar(value=self.ajustos.get("duplicats", True))
         self.v_estat = tk.StringVar()
         self.origens = {}          # text del desplegable → camí
@@ -151,11 +163,15 @@ class App(tk.Tk):
         self.treballant = False
         self.atura = threading.Event()
         self.ultima_desti = None
+        self.finestra_opcions = None
 
         self._estils()
         self.construeix()
         self.v_estat.set(self.t("Tria on vols buscar i què vols trobar."))
         self.protocol("WM_DELETE_WINDOW", self.surt)
+        # Cerca actualitzacions en obrir (un cop al dia, en silenci si no n'hi ha)
+        if self.v_auto.get() and self.ajustos.get("ultima_comprovacio") != date.today().isoformat():
+            self.after(2500, lambda: self.cerca_actualitzacions(silenci=True))
 
     def px(self, n):
         return int(n * self.escala)
@@ -204,7 +220,14 @@ class App(tk.Tk):
             "sistema": self.v_sistema.get(),
             "petites": self.v_petites.get(),
             "desti": self.v_desti.get(),
-            "carpetes": self.v_carpetes.get(),
+            "org": self.v_org.get(),
+            "mida_min": self._mida_min(),
+            "ometre": self.v_ometre.get(),
+            "so": self.v_so.get(),
+            "auto_act": self.v_auto.get(),
+            "any_des": self.v_any_des.get(),
+            "any_fins": self.v_any_fins.get(),
+            "ultima_comprovacio": self.ajustos.get("ultima_comprovacio", ""),
             "duplicats": self.v_duplicats.get(),
             "origen": self.origens.get(self.v_origen.get(), self.v_origen.get()),
         }
@@ -212,6 +235,12 @@ class App(tk.Tk):
             fitxer_ajustos().write_text(json.dumps(a, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:
             pass
+
+    def _mida_min(self):
+        try:
+            return max(0, int(self.v_mida_min.get()))
+        except (tk.TclError, ValueError):
+            return 30
 
     def surt(self):
         self.atura.set()
@@ -250,6 +279,13 @@ class App(tk.Tk):
         s.map("Treeview.Heading", background=[("active", FONS3)])
         s.configure("Horizontal.TProgressbar", troughcolor=FONS3, background=TARONJA,
                     bordercolor=LINIA, lightcolor=TARONJA, darkcolor=TARONJA2, thickness=self.px(14))
+        s.configure("TNotebook", background=FONS, bordercolor=LINIA, tabmargins=(0, 0, 0, 0))
+        s.configure("TNotebook.Tab", background=FONS3, foreground=SUAU, padding=(16, 6), bordercolor=LINIA,
+                    lightcolor=FONS3, font=(MT.TEXT, 10, "bold"))
+        s.map("TNotebook.Tab", background=[("selected", TARGETA)], foreground=[("selected", TARONJA)],
+              lightcolor=[("selected", TARGETA)])
+        s.configure("TSpinbox", fieldbackground=FONS3, foreground=CREMA, background=FONS3, arrowcolor=TARONJA,
+                    bordercolor=LINIA, lightcolor=FONS3, darkcolor=FONS3, insertcolor=CREMA, padding=4)
         s.configure("Vertical.TScrollbar", background=LINIA, troughcolor=FONS3, bordercolor=FONS3,
                     arrowcolor=SUAU, lightcolor=LINIA, darkcolor=LINIA)
 
@@ -280,12 +316,7 @@ class App(tk.Tk):
             tk.Label(cap, image=im, bg=FONS).pack(side="left")
         except Exception:
             tk.Label(cap, text="XORIGUER  CERCADOR", bg=FONS, fg=CREMA, font=(MT.TITOL, 18)).pack(side="left")
-        noms = [self.t("Sistema") if k == "" else v for k, v in NOMS_IDIOMES.items()]
-        cb = ttk.Combobox(cap, values=noms, state="readonly", width=10)
-        cb.current(list(NOMS_IDIOMES).index(self.idioma))
-        cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.canvia_idioma(list(NOMS_IDIOMES)[cb.current()]))
-        tk.Label(cap, text=self.t("Idioma"), bg=FONS, fg=SUAU, font=(MT.TEXT, 9)).pack(side="right", padx=6)
+        self.boto(cap, "⚙  " + self.t("Opcions"), self.obre_opcions, False).pack(side="right")
 
         self.cos = tk.Frame(self, bg=FONS, padx=20)
         self.cos.pack(fill="both", expand=True)
@@ -317,8 +348,20 @@ class App(tk.Tk):
         fila.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(fila, text=self.t("Omet carpetes del sistema i programes"),
                         variable=self.v_sistema).pack(side="left")
-        ttk.Checkbutton(fila, text=self.t("Omet imatges petites (icones, < 30 KB)"),
+        ttk.Checkbutton(fila, text=self.t("Omet imatges petites (icones, < {n} KB)", n=self._mida_min()),
                         variable=self.v_petites).pack(side="left", padx=(18, 0))
+        fila = tk.Frame(f, bg=TARGETA)
+        fila.pack(fill="x", pady=(8, 0))
+        anys = [self.t("Qualsevol")] + [str(a) for a in range(date.today().year, 1989, -1)]
+        tk.Label(fila, text=self.t("Data del fitxer, des de l'any"), bg=TARGETA, fg=SUAU,
+                 font=(MT.TEXT, 9)).pack(side="left")
+        for var, txt in ((self.v_any_des, None), (self.v_any_fins, "fins a")):
+            if txt:
+                tk.Label(fila, text=self.t(txt), bg=TARGETA, fg=SUAU, font=(MT.TEXT, 9)).pack(side="left", padx=(4, 0))
+            cb = ttk.Combobox(fila, values=anys, state="readonly", width=10)
+            cb.set(var.get() or anys[0])
+            cb.pack(side="left", padx=6)
+            cb.bind("<<ComboboxSelected>>", lambda e, c=cb, v=var: v.set("" if c.current() == 0 else c.get()))
         fila = tk.Frame(f, bg=TARGETA)
         fila.pack(fill="x", pady=(10, 0))
         self.b_cerca = self.boto(fila, "🔍  " + self.t("Cerca"), self.cerca)
@@ -334,10 +377,9 @@ class App(tk.Tk):
         fila = tk.Frame(f, bg=TARGETA)
         fila.pack(fill="x", pady=(8, 0))
         tk.Label(fila, text=self.t("Organització:"), bg=TARGETA, fg=SUAU, font=(MT.TEXT, 9)).pack(side="left")
-        ttk.Radiobutton(fila, text=self.t("Per tipus, mantenint les carpetes"), variable=self.v_carpetes,
-                        value=True).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(fila, text=self.t("Per tipus, tot junt"), variable=self.v_carpetes,
-                        value=False).pack(side="left", padx=(12, 0))
+        for val, txt in (("carpetes", "Per tipus, mantenint les carpetes"), ("data", "Per tipus i data (any/mes)"),
+                         ("junt", "Per tipus, tot junt")):
+            ttk.Radiobutton(fila, text=self.t(txt), variable=self.v_org, value=val).pack(side="left", padx=(10, 0))
         fila = tk.Frame(f, bg=TARGETA)
         fila.pack(fill="x", pady=(6, 0))
         ttk.Checkbutton(fila, text=self.t("Omet duplicats (mateix nom i mida)"),
@@ -387,6 +429,9 @@ class App(tk.Tk):
         self.construeix()
         self.v_estat.set(estat)
         self.desa_ajustos()
+        if self.finestra_opcions and self.finestra_opcions.winfo_exists():
+            self.finestra_opcions.destroy()
+            self.obre_opcions()
 
     def omple_origens(self, preferit=None):
         self.origens = {}
@@ -429,6 +474,164 @@ class App(tk.Tk):
         else:
             self.b_atura.pack_forget()
 
+    # ── So en acabar ────────────────────────────────────────────────────
+    def avisa(self):
+        if self.v_so.get():
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_OK)
+            except Exception:
+                self.bell()
+
+    # ── Finestra d'opcions (pestanyes Opcions i Quant a) ────────────────
+    def obre_opcions(self, pestanya=0):
+        if self.finestra_opcions and self.finestra_opcions.winfo_exists():
+            self.finestra_opcions.lift()
+            return
+        w = tk.Toplevel(self, bg=FONS, padx=16, pady=14)
+        self.finestra_opcions = w
+        w.title(self.t("Opcions") + " · Xoriguer Cercador")
+        w.transient(self)
+        w.resizable(False, False)
+        try:
+            w.iconbitmap(str(base_recursos() / "assets" / "icona.ico"))
+        except Exception:
+            pass
+        nb = ttk.Notebook(w)
+        nb.pack(fill="both", expand=True)
+
+        # Pestanya Opcions
+        o = tk.Frame(nb, bg=TARGETA, padx=18, pady=16)
+        nb.add(o, text=self.t("Opcions"))
+
+        def fila(text, pady=(0, 12)):
+            f = tk.Frame(o, bg=TARGETA)
+            f.pack(fill="x", pady=pady)
+            if text:
+                tk.Label(f, text=text, bg=TARGETA, fg=CREMA, font=(MT.TEXT, 10)).pack(side="left")
+            return f
+
+        f = fila(self.t("Idioma"))
+        noms = [self.t("Sistema") if k == "" else v for k, v in NOMS_IDIOMES.items()]
+        cb = ttk.Combobox(f, values=noms, state="readonly", width=14)
+        cb.current(list(NOMS_IDIOMES).index(self.idioma))
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.canvia_idioma(list(NOMS_IDIOMES)[cb.current()]))
+
+        f = fila(self.t("Mida mínima de les imatges (KB)"))
+        sp = ttk.Spinbox(f, from_=0, to=10000, increment=10, textvariable=self.v_mida_min, width=8)
+        sp.pack(side="right")
+
+        tk.Label(o, text=self.t("Carpetes que no vols mirar (separades per comes):"), bg=TARGETA, fg=CREMA,
+                 font=(MT.TEXT, 10)).pack(anchor="w")
+        ttk.Entry(o, textvariable=self.v_ometre, width=48).pack(fill="x", pady=(4, 2))
+        tk.Label(o, text=self.t("P. ex.: Steam, Temp, Descàrregues"), bg=TARGETA, fg=SUAU,
+                 font=(MT.TEXT, 9)).pack(anchor="w", pady=(0, 12))
+
+        ttk.Checkbutton(o, text=self.t("Fes un so quan acabi la cerca o la còpia"),
+                        variable=self.v_so).pack(anchor="w", pady=(0, 6))
+        ttk.Checkbutton(o, text=self.t("Cerca actualitzacions en obrir el programa"),
+                        variable=self.v_auto).pack(anchor="w")
+
+        # Pestanya Quant a
+        q = tk.Frame(nb, bg=TARGETA, padx=18, pady=16)
+        nb.add(q, text=self.t("Quant a"))
+        cap = tk.Frame(q, bg=TARGETA)
+        cap.pack(fill="x")
+        try:
+            ico = tk.PhotoImage(file=str(base_recursos() / "assets" / "icona_64.png"))
+            self._imatges.append(ico)
+            tk.Label(cap, image=ico, bg=TARGETA).pack(side="left", padx=(0, 14))
+        except Exception:
+            pass
+        txt = tk.Frame(cap, bg=TARGETA)
+        txt.pack(side="left", anchor="w")
+        tk.Label(txt, text="Xoriguer Cercador", bg=TARGETA, fg=CREMA, font=(MT.TITOL, 15)).pack(anchor="w")
+        tk.Label(txt, text=self.t("Versió {v}", v=VERSIO), bg=TARGETA, fg=TARONJA,
+                 font=(MT.TEXT, 10, "bold")).pack(anchor="w")
+        tk.Label(q, text=self.t("Cerca fitxers per tipus i els copia a un altre disc o a un pendrive.\n"
+                                "Gratis, sense anuncis i sense Internet (només per buscar actualitzacions)."),
+                 bg=TARGETA, fg=SUAU, font=(MT.TEXT, 10), justify="left").pack(anchor="w", pady=(14, 4))
+        tk.Label(q, text=self.t("Fet per Xavier Musté"), bg=TARGETA, fg=SUAU, font=(MT.TEXT, 10)).pack(anchor="w")
+        enll = tk.Label(q, text="xoriguer.dev", bg=TARGETA, fg=TARONJA, cursor="hand2",
+                        font=(MT.TEXT, 10, "underline"))
+        enll.pack(anchor="w", pady=(2, 14))
+        enll.bind("<Button-1>", lambda e: webbrowser.open(WEB))
+        b = tk.Frame(q, bg=TARGETA)
+        b.pack(fill="x")
+        self.b_act = self.boto(b, "🔄  " + self.t("Cerca actualitzacions"), self.cerca_actualitzacions)
+        self.b_act.pack(side="left")
+        self.v_act = tk.StringVar()
+        tk.Label(q, textvariable=self.v_act, bg=TARGETA, fg=CREMA, font=(MT.TEXT, 10), justify="left",
+                 wraplength=self.px(420)).pack(anchor="w", pady=(10, 0))
+
+        peu = tk.Frame(w, bg=FONS)
+        peu.pack(fill="x", pady=(12, 0))
+
+        def tanca():
+            self.desa_ajustos()
+            w.destroy()
+            self.construeix()      # la mida mínima surt al text de la casella
+        self.boto(peu, self.t("Tanca"), tanca, False).pack(side="right")
+        w.protocol("WM_DELETE_WINDOW", tanca)
+        nb.select(pestanya)
+        w.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - w.winfo_width()) // 2
+        y = self.winfo_rooty() + self.px(80)
+        w.geometry(f"+{max(0, x)}+{max(0, y)}")
+        w.grab_set()
+
+    # ── Actualitzacions ─────────────────────────────────────────────────
+    @staticmethod
+    def _tupla(v):
+        return tuple(int(x) if x.isdigit() else 0 for x in str(v).split("."))
+
+    def cerca_actualitzacions(self, silenci=False):
+        if not silenci:
+            self.v_act.set(self.t("Comprovant…"))
+            self.b_act.configure(state="disabled")
+
+        res = []      # el fil només hi deixa el resultat: tkinter s'ha de tocar des del fil principal
+
+        def fil():
+            try:
+                req = urllib.request.Request(URL_VERSIO, headers={"User-Agent": f"XoriguerCercador/{VERSIO}",
+                                                                  "Cache-Control": "no-cache"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    res.append((json.loads(r.read().decode("utf-8")), None))
+            except Exception as err:
+                res.append((None, err))
+        f = threading.Thread(target=fil, daemon=True)
+        f.start()
+
+        def espera():
+            if res:
+                self._resultat_act(*res[0], silenci)
+            else:
+                self.after(100, espera)
+        self.after(100, espera)
+
+    def _resultat_act(self, dades, err, silenci):
+        viu = not silenci and self.finestra_opcions and self.finestra_opcions.winfo_exists()
+        if viu:
+            self.b_act.configure(state="normal")
+        if err or not dades:
+            if viu:
+                self.v_act.set(self.t("No s'ha pogut comprovar. Tens connexió a Internet?"))
+            return
+        self.ajustos["ultima_comprovacio"] = date.today().isoformat()
+        self.desa_ajustos()
+        nova, url = str(dades.get("versio", "")), dades.get("url", "")
+        if nova and self._tupla(nova) > self._tupla(VERSIO) and str(url).startswith("https://"):
+            if viu:
+                self.v_act.set(self.t("Hi ha una versió nova: {v}.", v=nova))
+            pare = self.finestra_opcions if viu else self
+            if messagebox.askyesno("Xoriguer Cercador", self.t(
+                    "Hi ha una versió nova ({v}). Tens la {a}.\n\nLa vols baixar ara?", v=nova, a=VERSIO), parent=pare):
+                webbrowser.open(url)
+        elif viu:
+            self.v_act.set(self.t("Ja tens la versió més nova ({v}).", v=VERSIO))
+
     # ── Llista de resultats ─────────────────────────────────────────────
     def omple_arbre(self):
         self.arbre.delete(*self.arbre.get_children())
@@ -436,14 +639,14 @@ class App(tk.Tk):
             n = sum(len(v) for v in exts.values())
             if not n:
                 continue
-            mida = sum(m for v in exts.values() for _, m in v)
+            mida = sum(m for v in exts.values() for _, m, _d in v)
             on = self.marcats.get(cat, True)
             nom = ("☑  " if on else "☐  ") + ICONES[cat] + "  " + self.t(cat)
             self.arbre.insert("", "end", iid=cat, text=nom, values=(self.num(n, 0), self.mida(mida)),
                               tags=("cat",) if on else ("cat", "off"))
             for ext, llista in sorted(exts.items(), key=lambda kv: -len(kv[1])):
                 self.arbre.insert(cat, "end", text="." + ext, values=(
-                    self.num(len(llista), 0), self.mida(sum(m for _, m in llista))),
+                    self.num(len(llista), 0), self.mida(sum(m for _, m, _d in llista))),
                     tags=() if on else ("off",))
 
     def clic_arbre(self, ev):
@@ -490,12 +693,16 @@ class App(tk.Tk):
         self.progres.configure(mode="indeterminate")
         self.progres.start(12)
         self.inici = time.time()
+        ometre = {x.strip().lower() for x in self.v_ometre.get().replace(";", ",").split(",") if x.strip()}
+        des = datetime(int(self.v_any_des.get()), 1, 1).timestamp() if self.v_any_des.get() else None
+        fins = datetime(int(self.v_any_fins.get()) + 1, 1, 1).timestamp() if self.v_any_fins.get() else None
+        petita = self._mida_min() * 1024 if self.v_petites.get() else 0
         fil = threading.Thread(target=self._cerca_fil, daemon=True, args=(
-            origen, ext_cat, self.v_sistema.get(), self.v_petites.get(), excloure))
+            origen, ext_cat, self.v_sistema.get(), petita, excloure, ometre, des, fins))
         fil.start()
         self._segueix_cerca(fil)
 
-    def _cerca_fil(self, origen, ext_cat, sistema, petites, excloure):
+    def _cerca_fil(self, origen, ext_cat, sistema, petita, excloure, ometre=(), des=None, fins=None):
         pila = [origen]
         res = self.resultats
         while pila and not self.atura.is_set():
@@ -513,6 +720,8 @@ class App(tk.Tk):
                             nom = e.name.lower()
                             if sistema and (nom in CARPETES_SISTEMA or nom.startswith("$")):
                                 continue
+                            if nom in ometre:
+                                continue
                             if excloure and os.path.normcase(e.path) == excloure:
                                 continue
                             pila.append(e.path)
@@ -524,10 +733,13 @@ class App(tk.Tk):
                             cat = ext_cat.get(ext)
                             if not cat:
                                 continue
-                            mida = e.stat(follow_symlinks=False).st_size
-                            if petites and cat == "Imatges" and mida < IMATGE_PETITA:
+                            st = e.stat(follow_symlinks=False)
+                            mida, dt = st.st_size, st.st_mtime
+                            if petita and cat == "Imatges" and mida < petita:
                                 continue
-                            res[cat].setdefault(ext, []).append((e.path, mida))
+                            if (des and dt < des) or (fins and dt >= fins):
+                                continue
+                            res[cat].setdefault(ext, []).append((e.path, mida, dt))
                             self.trobats += 1
                     except OSError:
                         continue
@@ -541,8 +753,9 @@ class App(tk.Tk):
         self.progres.configure(mode="determinate", value=0)
         self.posa_treballant(False)
         self.omple_arbre()
+        self.avisa()
         n = self.trobats
-        mida = sum(m for exts in self.resultats.values() for v in exts.values() for _, m in v)
+        mida = sum(m for exts in self.resultats.values() for v in exts.values() for _, m, _d in v)
         if self.atura.is_set():
             self.v_estat.set(f"{self.t('Aturat.')}  {self.t('Fitxers')}: {self.num(n, 0)} · {self.mida(mida)}")
         elif n:
@@ -566,14 +779,14 @@ class App(tk.Tk):
         except OSError as err:
             return messagebox.showerror("Xoriguer Cercador", str(err), parent=self)
         desti = os.path.abspath(desti)
-        feina = [(cat, cami, mida) for cat, exts in self.resultats.items() if self.marcats.get(cat, True)
-                 for v in exts.values() for cami, mida in v]
+        feina = [(cat, cami, mida, dt) for cat, exts in self.resultats.items() if self.marcats.get(cat, True)
+                 for v in exts.values() for cami, mida, dt in v]
         if not feina:
             return messagebox.showwarning("Xoriguer Cercador", self.t("No hi ha res marcat per copiar."),
                                           parent=self)
         self.desa_ajustos()
         # Espai i FAT32
-        total = sum(m for _, _, m in feina)
+        total = sum(f[2] for f in feina)
         try:
             lliure = shutil.disk_usage(desti).free
         except OSError:
@@ -587,7 +800,7 @@ class App(tk.Tk):
         _, fs = info_volum(os.path.splitdrive(desti)[0] + "\\")
         fat32 = fs.upper() in ("FAT32", "FAT")
         if fat32:
-            grans = sum(1 for _, _, m in feina if m > MIDA_FAT32)
+            grans = sum(1 for f in feina if f[2] > MIDA_FAT32)
             if grans:
                 messagebox.showinfo(self.t("Pendrive FAT32"), self.t(
                     "La destinació és FAT32 i hi ha {n} fitxers de més de 4 GB que no s'hi poden copiar. "
@@ -599,16 +812,16 @@ class App(tk.Tk):
         self.inici = time.time()
         self.ultima_desti = desti
         fil = threading.Thread(target=self._copia_fil, daemon=True, args=(
-            feina, desti, self.origen_cercat, self.v_carpetes.get(), self.v_duplicats.get(), fat32))
+            feina, desti, self.origen_cercat, self.v_org.get(), self.v_duplicats.get(), fat32))
         fil.start()
         self.n_feina = len(feina)
         self._segueix_copia(fil)
 
-    def _copia_fil(self, feina, desti, origen, carpetes, duplicats, fat32):
+    def _copia_fil(self, feina, desti, origen, org, duplicats, fat32):
         st = self.estat_copia
         vistos = set()
         usats = set()          # camins de destinació ja fets servir en aquesta còpia
-        for cat, cami, mida in feina:
+        for cat, cami, mida, dt in feina:
             if self.atura.is_set():
                 break
             st["i"] += 1
@@ -620,10 +833,16 @@ class App(tk.Tk):
                     continue
                 vistos.add(clau)
                 carpeta_cat = os.path.join(desti, self.t(cat))
-                if carpetes:
+                if org == "carpetes":
                     rel = os.path.relpath(os.path.dirname(cami), origen)
                     rel = "" if rel == "." else rel
                     final = os.path.join(carpeta_cat, rel, nom)
+                elif org == "data":
+                    try:
+                        d = datetime.fromtimestamp(dt)
+                        final = os.path.join(carpeta_cat, f"{d.year}", f"{d.year}-{d.month:02d}", nom)
+                    except (OverflowError, OSError, ValueError):
+                        final = os.path.join(carpeta_cat, self.t("Sense data"), nom)
                 else:
                     final = os.path.join(carpeta_cat, nom)
                 # Ja hi és (d'una còpia anterior)? Mateixa mida → no cal tornar-lo a copiar.
@@ -659,6 +878,7 @@ class App(tk.Tk):
             return
         self.posa_treballant(False)
         self.b_obre.pack(side="left", padx=8)
+        self.avisa()
         text = self.t("Copiats {c} fitxers ({mida}) en {t}. Omesos: {o}. Errors: {e}.",
                       c=self.num(st["copiats"], 0), mida=self.mida(st["bytes_copiats"]), t=self.durada(t),
                       o=self.num(st["omesos"], 0), e=self.num(len(st["errors"]), 0))
