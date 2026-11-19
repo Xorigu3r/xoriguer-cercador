@@ -19,9 +19,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import marca_tk as MT
+from dates import data_real
 from traduccions import IDIOMES, NOMS_IDIOMES, T
 
-VERSIO = "1.1"
+VERSIO = "1.2"
 URL_VERSIO = "https://xoriguer.dev/versions/cercador/versio.json"
 WEB = "https://xoriguer.dev/#p-cercador"
 
@@ -53,7 +54,6 @@ CARPETES_SISTEMA = {
     "recovery", "msocache", "perflogs", "config.msi", "windows.old", "intel", "amd", "nvidia",
     "node_modules", ".git", "__pycache__", ".cache", ".gradle", ".m2", ".nuget", ".vscode", "site-packages",
 }
-IMATGE_PETITA = 30 * 1024
 MIDA_FAT32 = 4 * 1024 ** 3 - 1
 
 
@@ -150,15 +150,20 @@ class App(tk.Tk):
         self.v_auto = tk.BooleanVar(value=self.ajustos.get("auto_act", True))
         self.v_any_des = tk.StringVar(value=self.ajustos.get("any_des", ""))
         self.v_any_fins = tk.StringVar(value=self.ajustos.get("any_fins", ""))
-        self.v_origen = tk.StringVar()
+        # Orígens: discos i carpetes afegides, cadascun amb la seva casella (se'n poden marcar diversos)
+        self.carpetes_origen = [c for c in self.ajustos.get("carpetes_origen", []) if isinstance(c, str)]
+        marcats = self.ajustos.get("origens")
+        if marcats is None:
+            marcats = [self.ajustos["origen"]] if self.ajustos.get("origen") else ["C:\\"]
+        self.v_orig = {c: tk.BooleanVar(value=True) for c in marcats if isinstance(c, str)}
+        self.v_exif = tk.BooleanVar(value=self.ajustos.get("exif", True))
         self.v_desti = tk.StringVar(value=self.ajustos.get("desti", ""))
         org = self.ajustos.get("org") or ("carpetes" if self.ajustos.get("carpetes", True) else "junt")
         self.v_org = tk.StringVar(value=org)
         self.v_duplicats = tk.BooleanVar(value=self.ajustos.get("duplicats", True))
         self.v_estat = tk.StringVar()
-        self.origens = {}          # text del desplegable → camí
-        self.origen_cercat = None  # camí de la darrera cerca
-        self.resultats = {}        # categoria → {ext: [(camí, mida), ...]}
+        self.origens_cercats = []  # camins de la darrera cerca (l'índex va a cada resultat)
+        self.resultats = {}        # categoria → {ext: [(camí, mida, data, núm. d'origen, data_real_llegida), ...]}
         self.marcats = {}          # categoria → bool (a la llista de resultats)
         self.treballant = False
         self.atura = threading.Event()
@@ -229,7 +234,9 @@ class App(tk.Tk):
             "any_fins": self.v_any_fins.get(),
             "ultima_comprovacio": self.ajustos.get("ultima_comprovacio", ""),
             "duplicats": self.v_duplicats.get(),
-            "origen": self.origens.get(self.v_origen.get(), self.v_origen.get()),
+            "origens": [c for c, v in self.v_orig.items() if v.get()],
+            "carpetes_origen": self.carpetes_origen,
+            "exif": self.v_exif.get(),
         }
         try:
             fitxer_ajustos().write_text(json.dumps(a, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -323,12 +330,15 @@ class App(tk.Tk):
 
         # 1. Origen
         f = self.targeta(self.t("1. On busco?"))
+        self.marc_origens = tk.Frame(f, bg=TARGETA)
+        self.marc_origens.pack(fill="x")
         fila = tk.Frame(f, bg=TARGETA)
-        fila.pack(fill="x")
-        self.cb_origen = ttk.Combobox(fila, textvariable=self.v_origen, state="readonly", font=(MT.TEXT, 10))
-        self.cb_origen.pack(side="left", fill="x", expand=True)
-        self.boto(fila, self.t("Carpeta…"), self.tria_origen, False).pack(side="left", padx=(8, 0))
-        self.omple_origens(self.ajustos.get("origen"))
+        fila.pack(fill="x", pady=(8, 0))
+        self.boto(fila, "➕  " + self.t("Afegeix una carpeta…"), self.tria_origen, False).pack(side="left")
+        self.boto(fila, "↻", self.omple_origens, False).pack(side="left", padx=(8, 0))
+        tk.Label(fila, text=self.t("Pots marcar-ne diversos: es miren tots alhora."), bg=TARGETA, fg=SUAU,
+                 font=(MT.TEXT, 9)).pack(side="left", padx=12)
+        self.omple_origens()
 
         # 2. Tipus
         f = self.targeta(self.t("2. Què busco?"))
@@ -433,27 +443,56 @@ class App(tk.Tk):
             self.finestra_opcions.destroy()
             self.obre_opcions()
 
-    def omple_origens(self, preferit=None):
-        self.origens = {}
-        for arrel, tipus, etiqueta in unitats():
-            text = f"{arrel}   {self.t(tipus)}" + (f" · {etiqueta}" if etiqueta else "")
-            self.origens[text] = arrel
-        if preferit and preferit not in self.origens.values() and os.path.isdir(preferit):
-            self.origens[preferit] = preferit
-        self.cb_origen["values"] = list(self.origens)
-        for text, cami in self.origens.items():
-            if cami == preferit:
-                self.v_origen.set(text)
-                break
-        else:
-            if self.origens and self.v_origen.get() not in self.origens:
-                self.v_origen.set(next(iter(self.origens)))
+    def omple_origens(self):
+        """Una casella per a cada disc i per a cada carpeta afegida (amb ✕ per treure-la)."""
+        for w in self.marc_origens.winfo_children():
+            w.destroy()
+        def curt(c, maxim=46):   # «C:\…\Fotos\Mòbil» si el camí és massa llarg
+            if len(c) <= maxim:
+                return c
+            parts = c.split("\\")
+            cua = parts[-1]
+            for x in reversed(parts[1:-1]):
+                if len(cua) + len(x) + 6 > maxim:
+                    break
+                cua = x + "\\" + cua
+            return parts[0] + "\…\\" + cua
+        elements = [(arrel, f"{arrel}  {self.t(tipus)}" + (f" · {etiqueta}" if etiqueta else ""), False)
+                    for arrel, tipus, etiqueta in unitats()]
+        elements += [(c, f"📁 {curt(c)}", True) for c in self.carpetes_origen]
+        for i, (cami, text, treure) in enumerate(elements):
+            var = self.v_orig.setdefault(cami, tk.BooleanVar(value=False))
+            cel = tk.Frame(self.marc_origens, bg=TARGETA)
+            cel.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 24), pady=2)
+            ttk.Checkbutton(cel, text=text, variable=var).pack(side="left")
+            if treure:
+                x = tk.Label(cel, text="✕", bg=TARGETA, fg=SUAU, cursor="hand2", font=(MT.TEXT, 10))
+                x.pack(side="left", padx=(6, 0))
+                x.bind("<Button-1>", lambda e, c=cami: self.treu_origen(c))
+
+    def treu_origen(self, cami):
+        if cami in self.carpetes_origen:
+            self.carpetes_origen.remove(cami)
+        self.v_orig.pop(cami, None)
+        self.omple_origens()
+        self.desa_ajustos()
 
     def tria_origen(self):
         d = filedialog.askdirectory(parent=self)
         if d:
             d = os.path.normpath(d)
-            self.omple_origens(d)
+            if d not in self.carpetes_origen and len(d) > 3:
+                self.carpetes_origen.append(d)
+            self.v_orig.setdefault(d, tk.BooleanVar()).set(True)
+            self.omple_origens()
+            self.desa_ajustos()
+
+    def origens_marcats(self):
+        """Camins marcats que existeixen, sense els que són dins d'un altre de marcat."""
+        ordre = [a for a, _, _ in unitats()] + self.carpetes_origen
+        tots = [c for c in ordre if self.v_orig.get(c) and self.v_orig[c].get() and os.path.isdir(c)]
+        norm = {c: os.path.normcase(os.path.abspath(c)).rstrip("\\") + "\\" for c in tots}
+        return [c for c in tots if not any(o != c and norm[c].startswith(norm[o]) for o in tots)]
 
     def tria_desti(self):
         d = filedialog.askdirectory(parent=self, initialdir=self.v_desti.get() or None)
@@ -528,6 +567,8 @@ class App(tk.Tk):
         tk.Label(o, text=self.t("P. ex.: Steam, Temp, Descàrregues"), bg=TARGETA, fg=SUAU,
                  font=(MT.TEXT, 9)).pack(anchor="w", pady=(0, 12))
 
+        ttk.Checkbutton(o, text=self.t("Data de les fotos i vídeos: quan es van fer (EXIF), si es pot saber"),
+                        variable=self.v_exif).pack(anchor="w", pady=(0, 6))
         ttk.Checkbutton(o, text=self.t("Fes un so quan acabi la cerca o la còpia"),
                         variable=self.v_so).pack(anchor="w", pady=(0, 6))
         ttk.Checkbutton(o, text=self.t("Cerca actualitzacions en obrir el programa"),
@@ -639,14 +680,14 @@ class App(tk.Tk):
             n = sum(len(v) for v in exts.values())
             if not n:
                 continue
-            mida = sum(m for v in exts.values() for _, m, _d in v)
+            mida = sum(x[1] for v in exts.values() for x in v)
             on = self.marcats.get(cat, True)
             nom = ("☑  " if on else "☐  ") + ICONES[cat] + "  " + self.t(cat)
             self.arbre.insert("", "end", iid=cat, text=nom, values=(self.num(n, 0), self.mida(mida)),
                               tags=("cat",) if on else ("cat", "off"))
             for ext, llista in sorted(exts.items(), key=lambda kv: -len(kv[1])):
                 self.arbre.insert(cat, "end", text="." + ext, values=(
-                    self.num(len(llista), 0), self.mida(sum(m for _, m, _d in llista))),
+                    self.num(len(llista), 0), self.mida(sum(x[1] for x in llista))),
                     tags=() if on else ("off",))
 
     def clic_arbre(self, ev):
@@ -664,8 +705,8 @@ class App(tk.Tk):
 
     # ── Cerca ───────────────────────────────────────────────────────────
     def cerca(self):
-        origen = self.origens.get(self.v_origen.get())
-        if not origen or not os.path.isdir(origen):
+        origens = self.origens_marcats()
+        if not origens:
             return messagebox.showwarning("Xoriguer Cercador", self.t("Tria on buscar."), parent=self)
         ext_cat = {}
         for c, exts in CATEGORIES.items():
@@ -685,8 +726,8 @@ class App(tk.Tk):
         excloure = os.path.normcase(os.path.abspath(desti)) if desti else None
         self.resultats = {c: {} for c in ICONES}
         self.marcats = {}
-        self.origen_cercat = origen
-        self.trobats = 0
+        self.origens_cercats = origens
+        self.comptes = [0] * len(origens)
         self.omple_arbre()
         self.atura.clear()
         self.posa_treballant(True)
@@ -697,12 +738,21 @@ class App(tk.Tk):
         des = datetime(int(self.v_any_des.get()), 1, 1).timestamp() if self.v_any_des.get() else None
         fins = datetime(int(self.v_any_fins.get()) + 1, 1, 1).timestamp() if self.v_any_fins.get() else None
         petita = self._mida_min() * 1024 if self.v_petites.get() else 0
-        fil = threading.Thread(target=self._cerca_fil, daemon=True, args=(
-            origen, ext_cat, self.v_sistema.get(), petita, excloure, ometre, des, fins))
+        opcions = (ext_cat, self.v_sistema.get(), petita, excloure, ometre, des, fins, self.v_exif.get())
+
+        def tots():     # un fil per origen: discos diferents es llegeixen alhora
+            fils = [threading.Thread(target=self._cerca_fil, args=(i, o) + opcions, daemon=True)
+                    for i, o in enumerate(origens)]
+            for f in fils:
+                f.start()
+            for f in fils:
+                f.join()
+        fil = threading.Thread(target=tots, daemon=True)
         fil.start()
         self._segueix_cerca(fil)
 
-    def _cerca_fil(self, origen, ext_cat, sistema, petita, excloure, ometre=(), des=None, fins=None):
+    def _cerca_fil(self, oi, origen, ext_cat, sistema, petita, excloure, ometre=(), des=None, fins=None,
+                   exif=False):
         pila = [origen]
         res = self.resultats
         while pila and not self.atura.is_set():
@@ -729,6 +779,8 @@ class App(tk.Tk):
                             p = e.name.rfind(".")
                             if p <= 0:
                                 continue
+                            if sistema and e.name.startswith(".trashed-"):   # paperera de la galeria d'Android
+                                continue
                             ext = e.name[p + 1:].lower()
                             cat = ext_cat.get(ext)
                             if not cat:
@@ -737,16 +789,24 @@ class App(tk.Tk):
                             mida, dt = st.st_size, st.st_mtime
                             if petita and cat == "Imatges" and mida < petita:
                                 continue
-                            if (des and dt < des) or (fins and dt >= fins):
-                                continue
-                            res[cat].setdefault(ext, []).append((e.path, mida, dt))
-                            self.trobats += 1
+                            llegida = False
+                            if des or fins:
+                                # Una foto es fa abans de l'última modificació: si el fitxer ja és d'abans de
+                                # «des de», no cal obrir-lo per llegir-ne l'EXIF.
+                                if des and dt < des:
+                                    continue
+                                if exif:
+                                    dt, llegida = data_real(e.path, ext) or dt, True
+                                if (des and dt < des) or (fins and dt >= fins):
+                                    continue
+                            res[cat].setdefault(ext, []).append((e.path, mida, dt, oi, llegida))
+                            self.comptes[oi] += 1
                     except OSError:
                         continue
 
     def _segueix_cerca(self, fil):
         if fil.is_alive():
-            self.v_estat.set(self.t("Cercant… {n} fitxers trobats", n=self.num(self.trobats, 0)))
+            self.v_estat.set(self.t("Cercant… {n} fitxers trobats", n=self.num(sum(self.comptes), 0)))
             self.after(150, self._segueix_cerca, fil)
             return
         self.progres.stop()
@@ -754,8 +814,8 @@ class App(tk.Tk):
         self.posa_treballant(False)
         self.omple_arbre()
         self.avisa()
-        n = self.trobats
-        mida = sum(m for exts in self.resultats.values() for v in exts.values() for _, m, _d in v)
+        n = sum(len(v) for exts in self.resultats.values() for v in exts.values())
+        mida = sum(x[1] for exts in self.resultats.values() for v in exts.values() for x in v)
         if self.atura.is_set():
             self.v_estat.set(f"{self.t('Aturat.')}  {self.t('Fitxers')}: {self.num(n, 0)} · {self.mida(mida)}")
         elif n:
@@ -779,8 +839,8 @@ class App(tk.Tk):
         except OSError as err:
             return messagebox.showerror("Xoriguer Cercador", str(err), parent=self)
         desti = os.path.abspath(desti)
-        feina = [(cat, cami, mida, dt) for cat, exts in self.resultats.items() if self.marcats.get(cat, True)
-                 for v in exts.values() for cami, mida, dt in v]
+        feina = [(cat,) + x for cat, exts in self.resultats.items() if self.marcats.get(cat, True)
+                 for v in exts.values() for x in v]
         if not feina:
             return messagebox.showwarning("Xoriguer Cercador", self.t("No hi ha res marcat per copiar."),
                                           parent=self)
@@ -812,16 +872,30 @@ class App(tk.Tk):
         self.inici = time.time()
         self.ultima_desti = desti
         fil = threading.Thread(target=self._copia_fil, daemon=True, args=(
-            feina, desti, self.origen_cercat, self.v_org.get(), self.v_duplicats.get(), fat32))
+            feina, desti, self.origens_cercats, self.v_org.get(), self.v_duplicats.get(), fat32, self.v_exif.get()))
         fil.start()
         self.n_feina = len(feina)
         self._segueix_copia(fil)
 
-    def _copia_fil(self, feina, desti, origen, org, duplicats, fat32):
+    @staticmethod
+    def noms_origens(origens):
+        """Nom de la subcarpeta de cada origen quan n'hi ha més d'un: «C», «D», «Fotos»..."""
+        noms, usats = [], set()
+        for o in origens:
+            n = os.path.basename(o.rstrip("\\/")) or o[0].upper()
+            base, k = n, 2
+            while n.lower() in usats:
+                n, k = f"{base} ({k})", k + 1
+            usats.add(n.lower())
+            noms.append(n)
+        return noms
+
+    def _copia_fil(self, feina, desti, origens, org, duplicats, fat32, exif=False):
+        noms_o = self.noms_origens(origens) if len(origens) > 1 else [""] * len(origens)
         st = self.estat_copia
         vistos = set()
         usats = set()          # camins de destinació ja fets servir en aquesta còpia
-        for cat, cami, mida, dt in feina:
+        for cat, cami, mida, dt, oi, llegida in feina:
             if self.atura.is_set():
                 break
             st["i"] += 1
@@ -834,10 +908,12 @@ class App(tk.Tk):
                 vistos.add(clau)
                 carpeta_cat = os.path.join(desti, self.t(cat))
                 if org == "carpetes":
-                    rel = os.path.relpath(os.path.dirname(cami), origen)
+                    rel = os.path.relpath(os.path.dirname(cami), origens[oi])
                     rel = "" if rel == "." else rel
-                    final = os.path.join(carpeta_cat, rel, nom)
+                    final = os.path.join(carpeta_cat, noms_o[oi], rel, nom)
                 elif org == "data":
+                    if exif and not llegida:
+                        dt = data_real(cami) or dt
                     try:
                         d = datetime.fromtimestamp(dt)
                         final = os.path.join(carpeta_cat, f"{d.year}", f"{d.year}-{d.month:02d}", nom)

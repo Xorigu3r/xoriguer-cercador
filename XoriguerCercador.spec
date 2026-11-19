@@ -3,7 +3,7 @@
 a = Analysis(
     ['app.py'],
     datas=[('assets', 'assets'), ('fonts', 'fonts')],
-    hiddenimports=['marca_tk', 'traduccions'],
+    hiddenimports=['marca_tk', 'traduccions', 'dates'],
     excludes=['matplotlib', 'numpy', 'pandas', 'scipy', 'PIL', 'openpyxl', 'reportlab'],
 )
 pyz = PYZ(a.pure)
